@@ -1,0 +1,54 @@
+livekit-agents>=1.0
+livekit-plugins-google>=1.0   # provides google.beta.realtime.RealtimeModel
+livekit-api>=0.7
+chromadb>=0.5
+redis>=5.0                    # aioredis is bundled in redis>=4.2
+pydantic>=2.0
+python-dotenv>=1.0
+httpx>=0.27
+google-genai>=1.0             # Google Gen AI SDK — required by RealtimeModel Live API
+playwright>=1.44              # pin to avoid breaking async API changes
+
+# ── Removed (replaced by gemini-live-2.5-flash-native-audio) ───────────────
+# livekit-plugins-silero     — VAD handled natively by the realtime model
+# google-cloud-texttospeech  — TTS handled natively by the realtime model
+# google-cloud-aiplatform    — was used for Vertex AI LLM; now native audio API
+# vertexai                   — same as above
+#
+# NOTE: If you still use RAG (rag.py) with Vertex AI embeddings, you need:
+#   google-cloud-aiplatform>=1.71.0
+#   vertexai>=1.71.0
+# Add them back if rag.py is active in your deployment.
+
+# ── Setup ──────────────────────────────────────────────────────────────────
+# conda create -n livekit python=3.11
+# conda activate livekit
+# pip install -r requirements.txt
+# playwright install chromium   ← run once after pip install
+#
+# ── Credentials ───────────────────────────────────────────────────────────
+# RealtimeModel (gemini-live-2.5-flash-native-audio) uses Google credentials
+# from GOOGLE_APPLICATION_CREDENTIALS env var (auto-set from voice-ai.json
+# in agent.py if not already set). No API key needed for Vertex-backed auth.
+# OR set GOOGLE_API_KEY=<your-key> for direct Gemini API access (non-Vertex).
+#
+# ── Redis (Windows / local dev) ───────────────────────────────────────────
+# Option A — Docker (recommended):
+#   docker run -d -p 6379:6379 --name redis redis:7-alpine
+#
+# Option B — WSL2:
+#   sudo apt install redis-server && sudo service redis-server start
+#
+# Option C — Upstash (free managed, India region):
+#   https://console.upstash.com → create DB → copy REDIS_URL to .env
+#
+# ── .env additions ────────────────────────────────────────────────────────
+# REDIS_URL=redis://localhost:6379          # local Docker / WSL2
+# REDIS_URL=rediss://user:pass@host:6380    # Upstash TLS
+# REDIS_STATE_TTL_DAYS=30                  # optional, default 30
+# GOOGLE_CLOUD_PROJECT=voice-v2-team       # used by RAG (rag.py)
+# GOOGLE_CLOUD_LOCATION=us-central1        # optional, default us-central1
+# GOOGLE_APPLICATION_CREDENTIALS=voice-ai.json  # optional, auto-set by agent.py
+# SMS_GATEWAY_AUTHKEY=<your-key>            # required to send booking-confirmation SMS
+#                                            # (previously hardcoded in agent.py — moved
+#                                            # here; SMS is skipped with a warning if unset)
