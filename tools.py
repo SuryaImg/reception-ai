@@ -654,6 +654,19 @@ def normalize_hindi_phone_number(phone_str: str) -> str:
         "صفر": 0, "زیرو": 0, "ایک": 1, "دو": 2, "تین": 3, "چار": 4,
         "پانچ": 5, "پانج": 5, "چھ": 6, "چھے": 6, "سات": 7, "آٹھ": 8,
         "اٹھ": 8, "نو": 9, "نائن": 9,
+        # Romanized/Hinglish Hindi number words — Hindi STT very often transliterates
+        # spoken digits to Latin ("nau aath do") instead of Devanagari, which the
+        # map previously missed entirely (parsed to an empty string).
+        "shunya": 0, "sunna": 0, "sifar": 0,
+        "ek": 1, "eak": 1,
+        "do": 2, "doe": 2,
+        "teen": 3, "tin": 3,
+        "char": 4, "chaar": 4,
+        "paanch": 5, "panch": 5, "paach": 5,
+        "chhe": 6, "che": 6, "chha": 6, "chah": 6, "cheh": 6,
+        "saat": 7, "sat": 7,
+        "aath": 8, "ath": 8, "aat": 8,
+        "nau": 9, "nao": 9,
         "एक": 1, "one": 1,
         "दो": 2, "two": 2,
         "तीन": 3, "three": 3,

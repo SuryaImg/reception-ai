@@ -101,49 +101,34 @@ def check_phone_alignment(clean_phone: str, caller_clean: str) -> bool:
     return False
 
 def normalize_and_align_phone_number(patient_phone: str, caller_phone_raw: str = "") -> str:
-    if patient_phone:
-        # Dynamic detection instead of a fixed phrase list: if what was passed in doesn't
-        # contain enough digits to be an actual phone number, the caller almost certainly
-        # meant "use the number I'm calling from" — regardless of the exact wording used
-        # ("yahi number", "yhi number hai", "same number", "this is the correct number",
-        # "isi pe kar do", etc., in any language). A fixed keyword list can never cover
-        # every possible phrasing, so this checks the actual content instead of specific
-        # words: real phone digits vs. descriptive text.
-        digits_only = re.sub(r"\D", "", patient_phone)
-        if len(digits_only) < 10 and caller_phone_raw:
-            caller_clean = re.sub(r"\D", "", caller_phone_raw)
-            if len(caller_clean) > 10 and caller_clean.startswith("91"):
-                caller_clean = caller_clean[2:]
-            elif len(caller_clean) == 11 and caller_clean.startswith("0"):
-                caller_clean = caller_clean[1:]
-            if len(caller_clean) == 10 and caller_clean[0] in "6789":
-                return caller_clean
+    """Normalize a spoken/typed phone number to plain digits — and NEVER silently
+    substitute the caller's own SIP / caller-ID number.
 
+    WHY (this bug recurred): the old code swapped in the caller ID whenever the
+    dictated number had fewer than 10 digits (Path A), OR merely "resembled" the
+    caller ID by shared prefix/suffix or small edit distance (Path B). Both booked
+    the WRONG number. Real example: caller said "907 9035 955"; the model passed a
+    partial fragment (< 10 digits), Path A replaced it with the number they happened
+    to be calling from ("7013008161"). A phone number must NEVER be inferred from the
+    caller ID by guesswork or length.
+
+    The ONLY legitimate way to use the calling number is when the caller EXPLICITLY
+    says "use the number I'm calling from" — handled separately and explicitly by the
+    `use_caller_phone` path in update_appointment_details, NOT here.
+
+    So this function now only:
+      * converts number-words / non-Latin digits to ASCII digits, and
+      * strips a leading +91 country code (12 digits) or a single trunk 0 (11 digits).
+    Anything that does not resolve to a valid 10-digit mobile is returned AS-IS, so
+    the caller is asked to repeat it — never replaced by a different number, never
+    padded, never truncated. `caller_phone_raw` is accepted for backwards-compat but
+    is deliberately UNUSED (kept so existing call sites don't break).
+    """
     clean_phone = normalize_hindi_phone_number(patient_phone)
     if len(clean_phone) == 12 and clean_phone.startswith("91"):
         clean_phone = clean_phone[2:]
     elif len(clean_phone) == 11 and clean_phone.startswith("0"):
         clean_phone = clean_phone[1:]
-        
-    if caller_phone_raw:
-        caller_clean = re.sub(r"\D", "", caller_phone_raw)
-        if len(caller_clean) > 10 and caller_clean.startswith("91"):
-            caller_clean = caller_clean[2:]
-        elif len(caller_clean) == 11 and caller_clean.startswith("0"):
-            caller_clean = caller_clean[1:]
-            
-        if len(caller_clean) == 10 and caller_clean[0] in "6789":
-            is_valid = clean_phone.isdigit() and len(clean_phone) == 10 and clean_phone[0] in "6789"
-            # Only fall back to the caller ID as an ASR-repair when the patient's
-            # stated number did NOT parse into a valid 10-digit mobile number.
-            # A number that already parsed as valid was captured correctly and
-            # must never be silently swapped for a different (even if similar)
-            # number just because it resembles the caller ID — the patient may
-            # legitimately be booking for someone else on a nearby/related line.
-            if not is_valid:
-                if check_phone_alignment(clean_phone, caller_clean):
-                    return caller_clean
-                
     return clean_phone
 
 
@@ -156,12 +141,15 @@ _CACHE_TTL = 120.0
 _human_voice_instructions = (
     "=== Identity ===\n"
     "You are Nikita, a professional female voice receptionist for Arora Hospital, handling live calls to book, look up, and reschedule appointments. Always use feminine Hindi verb forms ('bol rahi hoon', 'karti hoon'). Match the caller's language (Hindi, English, or Hinglish), and keep responses short (usually 1-2 sentences), confident, and natural — no filler words, no dead air, no repeating a sentence you already said. Each call starts with a clean slate; never refer to a previous call. If speech is garbled or unclear, ask the caller to repeat rather than guessing what they said.\n\n"
-    "=== CRITICAL: Never Leave Dead Air ===\n"
-    "You MUST respond within 2 seconds of the caller finishing speaking. NEVER stay silent — dead air makes the caller think the line is disconnected. "
-    "If you are processing something or waiting for a backend lookup, immediately say a brief filler like 'Ek second...', 'Haan ji, check kar rahi hoon', or 'Bilkul, dekhti hoon'. "
-    "Keep the conversation alive at all times — after answering a question, immediately ask the next relevant question or offer help. "
-    "Only stop talking when the caller explicitly says goodbye, hangs up, or asks you to stop. "
-    "If the caller goes quiet, proactively re-engage within 3 seconds with a gentle prompt.\n\n"
+    "=== CRITICAL: Never Leave Dead Air (but never repeat yourself) ===\n"
+    "Respond within about 2 seconds of the caller finishing — dead air makes them think the line dropped. "
+    "If a backend lookup genuinely takes a moment, you MAY say ONE short filler like 'Ek second...' or 'Haan ji, dekhti hoon' — but say it at most ONCE per lookup, and NEVER say the same filler again later in the call. Most turns need no filler at all; just answer. "
+    "Keep the conversation moving — after answering, ask the next genuinely-needed question. "
+    "Only stop talking when the caller says goodbye, hangs up, or asks you to stop.\n\n"
+    "=== NO REPETITION (hard rule) ===\n"
+    "Do NOT repeat a sentence, question, filler, or confirmation you have already said in this call. Say each thing at most once. "
+    "Before speaking, check what you said in your last few turns — if you are about to repeat it, either move forward (ask the next thing, or actually perform the booking) or, only if truly necessary, say it once in clearly different, shorter words. "
+    "In particular: do not ask 'confirm kar doon?' more than once for the same unchanged booking — once the caller says yes, immediately call confirm_appointment(user_confirmed=True) instead of asking again. Do not repeat 'check kar rahi hoon' on every turn. Do not re-read the whole summary once the caller has already heard it.\n\n"
     "=== How To Approach Every Turn ===\n"
     "The sections below describe what matters, not a script to recite verbatim. Before responding, reason through what the caller actually wants, what you already know (see the live state at the end of these instructions), and what — if anything — is genuinely missing or unclear. Then respond in your own natural words, in the caller's language. In particular:\n"
     "- Infer intent from context rather than requiring an exact trigger phrase. A caller describing symptoms, naming a doctor, or asking when someone is available is signalling booking intent even if they never say 'book an appointment'.\n"
@@ -186,7 +174,8 @@ _human_voice_instructions = (
     "- Scope: you handle Arora Hospital appointments, doctors, facilities, and related questions only. For anything else (other hospitals, general topics, unrelated requests), say briefly that it is outside what you can help with and steer back to the appointment.\n"
     "- Do not recommend or filter doctors by religion, and appointments are for human patients only — decline politely if asked otherwise.\n"
     "- Never present a summary with a missing or placeholder field ('N/A', 'unknown') — collect the real value first.\n"
-    "- A phone number must be a valid 10-digit number before it is used to search or book; if the caller gives something else, ask again for just the phone number.\n\n"
+    "- A phone number must be a valid 10-digit number before it is used to search or book; if the caller gives something else, ask again for just the phone number.\n"
+    "- The booking phone number MUST be the exact digits the caller spoke. When the caller says a number, pass those digits as the phone number — NEVER substitute the number they happen to be calling from. Only use the calling number if the caller explicitly asks for it and gives no digits, and even then read that number back and get a clear yes before booking. If a number doesn't come through as a full valid 10-digit mobile, ask them to repeat it — never guess, pad, or fill it in.\n\n"
     "=== Booking Conversation ===\n"
     "Work out early whether the caller wants to book, is just asking a question, or wants to manage an existing appointment (reschedule or look one up) — do not start the booking flow for someone who is only asking questions.\n"
     "For a new booking you will typically need: who it is for (the caller or someone else — and if someone else, that person's name), the reason for the visit (use it to infer the right department yourself, rather than asking the caller to name a department), a doctor preference (if they say 'any doctor', pick the earliest available yourself rather than listing every option), a date and time (resolve relative expressions like 'tomorrow' or 'evening' to concrete values yourself), and a phone number. If the requested time is in the future (including later today), proceed with the booking without checking slot availability.\n"
@@ -194,10 +183,11 @@ _human_voice_instructions = (
     "To reschedule an appointment made earlier in this same call, reuse everything already known and ask only for the new date/time. For a caller asking to change a pre-existing appointment from an earlier call, get their phone number, look the appointment up, confirm which one if there is more than one, then collect only the new date/time.\n"
     "While waiting on a backend lookup, say something natural to fill the silence (e.g. 'ek moment, check kar rahi hoon') so the line does not go quiet — once per lookup is enough; do not repeat it on every turn.\n\n"
     "=== Appointment Booking Agent Rules ===\n"
-    "- SOURCE OF TRUTH: Doctor names, Departments, Specializations, Availability, and Slots MUST ONLY come from the hospital database or tool responses. Never infer or hallucinate these. If unavailable, ask the database again instead of guessing.\n"
+    "- SOURCE OF TRUTH: Doctor names, Departments, Specializations, Availability, and Slots MUST ONLY come from the `check_available_doctors` tool (verified hospital data). NEVER name a doctor or department from your own medical knowledge or memory. If the tool has not confirmed it, do not say it.\n"
+    "- MANDATORY RETRIEVE-BEFORE-RESPOND: Before you name ANY doctor, list doctors, or tell a caller which department they need, you MUST call `check_available_doctors` (with the department if you have one) and use ONLY the doctors/departments it returns. This applies every time — never answer 'which doctors are available' or suggest a department from memory.\n"
     "- STATE MANAGEMENT: Maintain conversation state throughout the call. Persist patient_symptom, identified_department, selected_doctor, doctor_department, appointment_date, selected_slot, patient_name, and patient_phone. Once verified, NEVER overwrite unless user explicitly changes it or database returns updated info. Never replace verified information with assumptions.\n"
-    "- DEPARTMENT RESOLUTION: When user explains symptoms, determine department (e.g., Kidney pain -> Urology, Chest pain -> Cardiology) and LOCK IT. Do not change department later unless the user changes symptoms.\n"
-    "- DOCTOR VALIDATION: Before suggesting any doctor, verify the doctor exists, belongs to the identified department, and is available. Never suggest a doctor from another department. Do NOT silently substitute another doctor. If user requests an unavailable doctor, respond clearly that they are not available in that department and list who is.\n"
+    "- DEPARTMENT RESOLUTION: When the caller describes a symptom, call `check_available_doctors` to see which departments actually exist here, and map the symptom to one of THOSE departments only. If the natural specialty for the symptom is NOT among the hospital's departments (e.g. the caller needs Urology/Nephrology but this hospital has no such department), tell the caller plainly that the hospital does not have that specialty, read them the departments that DO exist, and let them choose — do NOT relabel a doctor from another department as the missing specialty, and do NOT invent a department. Once a valid, existing department is chosen, LOCK it.\n"
+    "- DOCTOR VALIDATION: A doctor may ONLY be offered for the exact department `check_available_doctors` lists them under. A doctor from Cardiology must NEVER be presented as being in Urology (or any other department). Before suggesting or confirming any doctor, confirm via the tool that the doctor exists AND belongs to the stated department. If the caller asks for a doctor who is not in the needed department, say clearly which department that doctor is actually in and offer the correct doctors for the needed department. Never silently substitute or relabel.\n"
     "- DOCTOR LOCK: Once user selects a doctor, LOCK doctor_id, doctor_name, and department. Never change doctor later automatically. If booking fails, explain why and ask user to choose another doctor.\n"
     "- SLOT VALIDATION: Before offering slots, retrieve fresh availability. If user selects a slot, reserve/validate it immediately. If a slot becomes unavailable, explain why and offer alternatives. Do not say 'Available' and then immediately say 'Unavailable' without explanation.\n"
     "- BOOKING ORDER: Always follow this order: 1. Symptoms -> 2. Department -> 3. Available doctors -> 4. User selects doctor -> 5. Validate doctor -> 6. Available slots -> 7. User selects slot -> 8. Patient name -> 9. Patient phone -> 10. Final verification -> 11. Booking. Never collect patient information before doctor and slot are finalized.\n"
@@ -405,6 +395,7 @@ async def update_agent_instructions(agent, state: AppointmentState):
         "General Physician", "Neurologist", "Pulmonology", "Dentistry",
         "Cardiology", "Surgeon", "Orthopedics", "Dermatology",
         "Gastroenterology", "ENT", "Gynecology", "Obstetrics",
+        "Urology", "Nephrology", "Ophthalmology", "Psychiatry",
     ]
     _offered_lower = {d.lower() for d in _by_dept.keys()}
     _not_offered = [s for s in _KNOWN_SPECIALTIES if s.lower() not in _offered_lower]
@@ -874,8 +865,15 @@ def save_cache_file(data: dict) -> None:
 
 async def fetch_live_hospital_data(force: bool = False) -> Optional[dict]:
     """
-    Fetch data live using async httpx or async Playwright by intercepting the JSON network requests.
-    Falls back to hospital_cache.json if live fetch fails.
+    Load hospital / doctor data EXCLUSIVELY from the local hospital_cache.json file.
+
+    Per requirement, NO network or API calls are made here — the staging endpoint
+    (HOSPITAL_URL) and the Playwright browser fallback have been removed. Doctor,
+    department, and hospital information come only from hospital_cache.json. The
+    in-memory _DATA_CACHE simply avoids re-reading the file on every single turn.
+
+    To refresh the data, update hospital_cache.json on disk (e.g. run scrapper.py
+    separately) and it will be picked up on the next reload (TTL) or with force=True.
     """
     now = time.monotonic()
     cached = _DATA_CACHE["value"]
@@ -888,110 +886,28 @@ async def fetch_live_hospital_data(force: bool = False) -> Optional[dict]:
         if not force and _DATA_CACHE["value"] and (now - _DATA_CACHE["updated_at"]) < _CACHE_TTL:
             return _DATA_CACHE["value"]
 
-        # Attempt 1: Direct Async HTTP fetch (extremely fast and lightweight)
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(HOSPITAL_URL)
-                if resp.status_code == 200:
-                    body = resp.json()
-                    if body:
-                        normalized = normalize_hospital_data(body)
-                        save_cache_file(normalized)
-                        _DATA_CACHE["value"] = normalized
-                        _DATA_CACHE["updated_at"] = time.monotonic()
-                        logger.info("Live data fetched via direct HTTP get")
-                        return normalized
-                else:
-                    logger.warning("Direct fetch failed with status code %d. Trying Playwright fallback.", resp.status_code)
-        except Exception as httpx_exc:
-            logger.warning("Direct fetch failed: %s. Trying Playwright fallback.", httpx_exc)
-
-        # Attempt 2: Playwright fallback (intercepting network requests)
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            logger.warning("playwright not installed")
-            return _DATA_CACHE.get("value")
-
-        # BUG FIX: this MUST be initialized before the try block below, not inside
-        # the ImportError except branch (where it was previously unreachable dead
-        # code after a `return`). Leaving it undefined caused an uncaught
-        # NameError every time the direct httpx fetch failed.
-        api_responses: list[dict] = []
-
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--blink-settings=imagesEnabled=false",
-                    ],
-                )
-                page = await browser.new_page()
-
-                pending_responses: list = []
-                def _collect_response(response) -> None:
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        pending_responses.append(response)
-                async def _block_resources(route, request) -> None:
-                    if request.resource_type in ("image", "font", "media"):
-                        await route.abort()
-                    else:
-                        await route.continue_()
-                page.on("response", _collect_response)
-                await page.route("**/*", _block_resources)
-
-                await page.goto(
-                    HOSPITAL_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
-                )
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=15_000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(2_000)
-
-                for resp in pending_responses:
-                    try:
-                        body = await resp.json()
-                        if body:
-                            api_responses.append({"url": resp.url, "data": body})
-                    except Exception:
-                        pass
-
-                await browser.close()
-
-        except Exception as exc:
-            logger.warning("fetch_live_hospital_data: Playwright error: %s", exc)
-
-        merged = {}
-        for entry in api_responses:
-            data = entry.get("data", {})
-            if isinstance(data, dict):
-                merged.update(data)
-        if merged:
-            normalized = normalize_hospital_data(merged)
-            save_cache_file(normalized)
-            _DATA_CACHE["value"] = normalized
-            _DATA_CACHE["updated_at"] = time.monotonic()
-            logger.info("Live data fetched via Playwright fallback")
-            return normalized
-
-        # Attempt 3: Load cached json as backup
+        # Read ONLY from hospital_cache.json — no httpx, no Playwright, no API.
         from tools import load_cache_data
         cache_data = load_cache_data()
-        if not _DATA_CACHE.get("value") and cache_data:
-            _DATA_CACHE["value"] = cache_data
+        if cache_data:
+            try:
+                normalized = normalize_hospital_data(cache_data)
+            except Exception as e:
+                logger.warning("normalize_hospital_data failed on cache; using raw cache: %s", e)
+                normalized = cache_data
+            _DATA_CACHE["value"] = normalized
             _DATA_CACHE["updated_at"] = time.monotonic()
-            logger.info("Loaded hospital cache data as backup")
-            return cache_data
+            _DATA_CACHE["status"] = "online"
+            logger.info(
+                "Hospital data loaded from hospital_cache.json (%d doctors, depts: %s)",
+                len(normalized.get("doctors", []) or []),
+                ", ".join(d.get("name", "") for d in (normalized.get("departments", []) or [])),
+            )
+            return normalized
 
+        # Cache file missing/empty — keep whatever we already had (may be None).
+        logger.error("hospital_cache.json is missing or empty — no doctor data available to serve.")
+        _DATA_CACHE["status"] = "offline"
         return _DATA_CACHE.get("value")
 
         
@@ -1168,10 +1084,59 @@ async def get_doctor_details(ctx: RunContext, doctor_name: str) -> str:
 @function_tool
 async def check_available_doctors(ctx: RunContext, department: str = "") -> str:
     """
-    Check the available doctors and departments from the live hospital system.
-    If a department is provided, it filters doctors by that department.F
+    Return the ACTUAL doctors and departments from the hospital's verified data
+    (hospital_cache.json). This is the ONLY authoritative source of who works here.
+    ALWAYS call this before naming any doctor or department to a caller.
+
+    - If `department` is given, returns the exact real doctors in that department, OR
+      explicitly states the hospital has no such department (and lists the real ones).
+    - If `department` is empty, returns every real department and its doctors.
+
+    Never name a doctor or department that does not appear in this tool's output.
     """
-    return "I'm sorry, I cannot provide a list of available doctors. Please let me know which department or specific doctor name you would like to book with."
+    data = await fetch_live_hospital_data(force=False)
+    if not data or not data.get("doctors"):
+        return ("HOSPITAL DATA UNAVAILABLE right now. Do NOT name any doctor or department. "
+                "Tell the caller you cannot look that up at the moment and ask them to try again shortly.")
+
+    by_dept: dict[str, list[str]] = {}
+    for d in data["doctors"]:
+        dept = (d.get("department") or d.get("specialization") or "").strip()
+        name = clean_doctor_name(d.get("doctorName") or d.get("name") or "")
+        if not dept or not name or name == "Unknown":
+            continue
+        avail = d.get("available")
+        if avail in (False, "false", "no", "No", 0, "0"):
+            continue
+        by_dept.setdefault(dept, []).append(f"Dr. {name}")
+
+    if not by_dept:
+        return ("No doctor records are available in the verified data. Do NOT invent any doctor. "
+                "Tell the caller no doctors are currently listed.")
+
+    available_depts = sorted(by_dept.keys())
+
+    if department and department.strip():
+        req = department.strip()
+        norm_req = (normalize_department(req) or req).lower()
+        matched_dept = None
+        for dept in by_dept:
+            if dept.lower() == req.lower() or (normalize_department(dept) or dept).lower() == norm_req:
+                matched_dept = dept
+                break
+        if matched_dept:
+            docs = ", ".join(sorted(set(by_dept[matched_dept])))
+            return (f"VERIFIED: the {matched_dept} department has exactly these doctors: {docs}. "
+                    f"Offer ONLY these exact doctors for {matched_dept} — do not add, rename, or invent any other.")
+        return (f"VERIFIED: this hospital does NOT have a '{req}' department, and has NO doctor for it. "
+                f"Clearly tell the caller that '{req}' is not available here. "
+                f"The hospital's ONLY departments are: {', '.join(available_depts)}. "
+                f"Do NOT list any doctor under '{req}', and do NOT relabel a doctor from another department as '{req}'. "
+                f"You may suggest the closest available department ONLY if it genuinely fits the caller's stated problem; otherwise say the specialty is unavailable.")
+
+    lines = [f"- {dept}: {', '.join(sorted(set(by_dept[dept])))}" for dept in available_depts]
+    return ("VERIFIED departments and their doctors (this is the COMPLETE list — never name any doctor "
+            "or department outside it):\n" + "\n".join(lines))
 
 @function_tool
 async def get_hospital_services(ctx: RunContext) -> str:
@@ -1593,6 +1558,54 @@ async def run_with_loading_announcement(coro, session, message: str):
         announcer_task.cancel()
 
 
+async def _doctor_department_error(state) -> Optional[str]:
+    """Grounding gate: return an error string if the booking's department/doctor is
+    NOT backed by verified hospital data — i.e. the department does not exist, the
+    doctor does not exist, or the doctor does not actually belong to the stated
+    department. Returns None when everything is consistent (or data is transiently
+    unavailable, so we don't block on a data gap). Makes it IMPOSSIBLE to book a
+    doctor under a department they are not in (e.g. a Cardiology doctor as 'Urology').
+    """
+    data = await fetch_live_hospital_data(force=False)
+    if not data or not data.get("doctors"):
+        return None
+    docs = data["doctors"]
+
+    real_depts = {}
+    for d in docs:
+        dn = (d.get("department") or d.get("specialization") or "").strip()
+        if dn:
+            real_depts[(normalize_department(dn) or dn).lower()] = dn
+            real_depts[dn.lower()] = dn
+
+    if state.department:
+        key = state.department.lower()
+        nkey = (normalize_department(state.department) or state.department).lower()
+        if key not in real_depts and nkey not in real_depts:
+            avail = sorted(set(real_depts.values()))
+            return (f"'{state.department}' is NOT a department at this hospital. The only departments are: "
+                    f"{', '.join(avail)}. Tell the caller this specialty is not available here and do not book. "
+                    f"Do not relabel any doctor as '{state.department}'.")
+
+    if state.doctor_name:
+        target = clean_doctor_name(state.doctor_name).lower()
+        match = None
+        for d in docs:
+            if clean_doctor_name(d.get("doctorName") or d.get("name") or "").lower() == target:
+                match = d
+                break
+        if match is None:
+            return (f"Dr. {clean_doctor_name(state.doctor_name)} is not in the verified doctor list. Do not book. "
+                    f"Call check_available_doctors and offer only a real doctor.")
+        actual_dept = (match.get("department") or match.get("specialization") or "").strip()
+        if state.department and actual_dept and not is_doctor_consistent_with_dept(match, state.department):
+            return (f"MISMATCH: Dr. {clean_doctor_name(state.doctor_name)} is in the {actual_dept} department, "
+                    f"NOT {state.department}. Do not book this. Tell the caller Dr. "
+                    f"{clean_doctor_name(state.doctor_name)} is in {actual_dept}; if they need {state.department}, "
+                    f"offer the real {state.department} doctors from check_available_doctors instead.")
+    return None
+
+
 async def get_consistent_doctors_for_dept(dept_name: str) -> list[dict]:
     data = await fetch_live_hospital_data()
     if not data or "doctors" not in data:
@@ -1624,8 +1637,9 @@ async def find_earliest_available_slot(doctor_name: str, date_str: str) -> Optio
     ]
     import datetime
     from storage import is_slot_locked
+    first_future = None  # earliest bookable (future) slot, regardless of lock state
     for slot in slots:
-        # Enforce Rule 8: Same-day booking must be at least 30 minutes in future
+        # Skip only slots that are actually in the PAST on the same day.
         try:
             today_date = _today_ist()
             parsed_date = datetime.datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
@@ -1639,9 +1653,21 @@ async def find_earliest_available_slot(doctor_name: str, date_str: str) -> Optio
                 if time_to_minutes(slot) < time_to_minutes(now_str):
                     continue
 
-        if not await is_slot_locked(doctor_name, date_str, slot):
+        if first_future is None:
+            first_future = slot
+        try:
+            locked = await is_slot_locked(doctor_name, date_str, slot)
+        except Exception as e:
+            # A lookup error must NEVER hide an otherwise-bookable slot.
+            logger.warning("is_slot_locked failed for %s %s %s: %s — treating as available", doctor_name, date_str, slot, e)
+            locked = False
+        if not locked:
             return slot
-    return None
+    # POLICY: multiple bookings per slot are allowed, so a day where every slot is
+    # merely "locked" is still bookable. Return the earliest future slot instead of
+    # falsely reporting that no slot is available today (the cause of the wrong
+    # "aaj koi doctor available nahi hai / kal dekhein" replies).
+    return first_future
 
 async def find_chronological_earliest_slot(doctor_name: str, max_days: int = 30) -> tuple[Optional[str], Optional[str]]:
     """Finds the earliest available slot for a given doctor starting from today."""
@@ -1662,7 +1688,8 @@ async def find_chronological_earliest_slot(doctor_name: str, max_days: int = 30)
     from storage import is_slot_locked
 
     today_date = _today_ist()
-    
+    first_future = None  # earliest future slot across the horizon (fallback)
+
     for day_offset in range(max_days):
         check_date = today_date + datetime.timedelta(days=day_offset)
         date_str = check_date.strftime("%Y-%m-%d")
@@ -1672,15 +1699,24 @@ async def find_chronological_earliest_slot(doctor_name: str, max_days: int = 30)
                 now_str = _now_ist().strftime("%I:%M %p")
                 if time_to_minutes(slot) < time_to_minutes(now_str):
                     continue
-            
+
+            if first_future is None:
+                first_future = (date_str, slot)
             try:
                 locked = await is_slot_locked(doctor_name, date_str, slot)
-                if not locked:
-                    return date_str, slot
             except Exception as e:
-                logger.error(f"Redis lookup failed for {doctor_name} on {date_str} {slot}: {e}")
-                raise e
+                # Previously this did `raise e`, aborting the whole search and making
+                # the agent say there was a technical problem / no slot. A lock
+                # lookup error must not hide a bookable slot — treat it as available.
+                logger.warning("is_slot_locked failed for %s %s %s: %s — treating as available", doctor_name, date_str, slot, e)
+                locked = False
+            if not locked:
+                return date_str, slot
 
+    # POLICY: locked slots are still bookable (multiple bookings allowed), so fall
+    # back to the earliest future slot rather than returning nothing.
+    if first_future:
+        return first_future
     return None, None
 
 
@@ -1692,7 +1728,7 @@ async def filter_available_doctors(docs: list[dict], date_str: str, time_str: st
     if not date_str or not time_str:
         return docs
     time_flex = time_str.lower().strip() in [
-        "any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time"
+        "any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", "turant", "turant wala", "turant wala slot", "abhi", "abhi ka", "abhi wala", "jaldi", "jaldi wala", "jald", "jitni jaldi ho sake", "immediate", "immediately", "now", "right now", "as soon as possible", "asap"
     ]
     if time_flex:
         return docs
@@ -1717,7 +1753,7 @@ async def find_earliest_available_doctor(docs: list[dict], date_str: str, time_s
     is_flex = False
     if time_str:
         t_clean = time_str.lower().strip()
-        if t_clean in ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", ""]:
+        if t_clean in ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", "turant", "turant wala", "turant wala slot", "abhi", "abhi ka", "abhi wala", "jaldi", "jaldi wala", "jald", "jitni jaldi ho sake", "immediate", "immediately", "now", "right now", "as soon as possible", "asap", ""]:
             is_flex = True
             
     if time_str and not is_flex:
@@ -2002,7 +2038,7 @@ async def update_appointment_details(
     appointment_time: Annotated[str, "The appointment time slot."] = "",
     time_preference: Annotated[str, "Preference for time, e.g. 'FLEXIBLE'."] = "",
     reason: Annotated[str, "The patient's symptom or reason for visit."] = "",
-    use_caller_phone: Annotated[bool, "Set to True whenever the caller means 'use the number I'm calling from' for the booking phone number — in whatever words they use (e.g. 'same number', 'yahi number', 'yhi number hai', 'isi number pe', 'this is the correct number', 'use this one'). Judge by meaning, not by matching an exact phrase."] = False,
+    use_caller_phone: Annotated[bool, "Set to True ONLY when the caller explicitly asks to use the number they are calling from AND speaks NO phone digits (e.g. just 'yahi number' / 'same number' with no number). If the caller speaks ANY phone digits — even partial or unclear — you MUST pass them as patient_phone and leave use_caller_phone FALSE. Never use this as a shortcut when a number was dictated; the booking number must be the digits the caller actually said."] = False,
     ignore_mismatch: Annotated[bool, "Set to True to ignore any department/symptom mismatch."] = False,
     mismatch_acknowledged: Annotated[bool, "Set to True if user acknowledged department/symptom mismatch."] = False,
     book_another_appointment: Annotated[bool, "Set to True to reset status and draft a new appointment."] = False,
@@ -2188,7 +2224,23 @@ async def update_appointment_details(
     # 2. Caller phone — only used when the patient EXPLICITLY says their number is the same as the calling number.
     # The LLM must NEVER pass use_caller_phone=True on its own; only when the user says
     # something like 'same number', 'usi number pe', 'is number pe', etc.
-    if use_caller_phone:
+    # A dictated number ALWAYS wins over "use my calling number". If the caller
+    # actually spoke digits in this same turn, honour those (validated below) and
+    # ignore use_caller_phone — this stops the calling-number from overriding a real
+    # number the caller just gave.
+    if use_caller_phone and patient_phone and re.sub(r"\D", "", normalize_hindi_phone_number(patient_phone)):
+        use_caller_phone = False
+
+    # Caller's own number is used ONLY when the caller explicitly asked for it AND
+    # did not dictate any number in this same turn. Two hard guards prevent the
+    # "wrong number" bug where the model wrongly set use_caller_phone even though the
+    # caller spoke their digits:
+    #   (1) if a dictated `patient_phone` is present, IGNORE use_caller_phone — the
+    #       dictated number always wins (handled by falling through to block 3).
+    #   (2) the caller-ID number is NOT auto-confirmed; the agent must read it back
+    #       digit-by-digit and get an explicit yes, so a mis-trigger can't silently
+    #       book the number the caller happens to be calling from.
+    if use_caller_phone and not (patient_phone and str(patient_phone).strip()):
         loop_err = check_loop("patient_phone")
         if loop_err: return loop_err
         caller_phone_raw = ctx.userdata.get("caller_phone", "")
@@ -2200,16 +2252,21 @@ async def update_appointment_details(
             clean_phone = re.sub(r"\D", "", caller_phone_raw)
             if len(clean_phone) > 10 and clean_phone.startswith("91"):
                 clean_phone = clean_phone[2:]
+            elif len(clean_phone) == 11 and clean_phone.startswith("0"):
+                clean_phone = clean_phone[1:]
             if len(clean_phone) == 10 and clean_phone[0] in "6789":
                 state.patient_phone = clean_phone
-                state.patient_phone_confirmed = True
-                state.phone_confirmation_attempts = 0
-                state.step_attempts["patient_phone"] = 0
-                pending_phone_response = None
+                state.patient_phone_confirmed = False  # must be explicitly confirmed
+                # Format the number so the model reads it clearly, digit by digit.
+                spaced = " ".join(clean_phone)
+                return (f"The caller wants to use the number they are calling from: {clean_phone} ({spaced}). "
+                        f"Read this exact number back to the caller digit by digit and ask them to confirm it is "
+                        f"the correct number for the booking, or to give a different 10-digit number. Do NOT book "
+                        f"until they confirm THIS number. If they give a different number, use that instead.")
             else:
-                return "Error: Caller phone number is not a valid 10-digit Indian mobile number. Please ask the patient to say their number clearly."
+                return "Error: The number you are calling from is not a valid 10-digit Indian mobile number. Please ask the caller to say the 10-digit number they want to use."
         else:
-            return "Error: No caller phone number available in this session. Please ask the patient to provide their contact number."
+            return "Error: No caller phone number is available in this session. Please ask the caller to say the 10-digit number they want to use."
 
     if confirm_patient_phone:
         loop_err = check_loop("patient_phone")
@@ -2228,12 +2285,20 @@ async def update_appointment_details(
             state.patient_phone = None  # Revert invalid/partial phone capture
             state.patient_phone_confirmed = False
             state.phone_confirmation_attempts = 0
-            # Be explicit: the model must RE-ASK now and must not move on to the
-            # next step with a missing/invalid number (the cause of the transcript
-            # loop, where an unparsed number was silently skipped past).
-            return (f"'{patient_phone}' is not a complete valid 10-digit Indian mobile number. "
-                    "Ask the caller to repeat their full 10-digit mobile number slowly, digit by digit, "
-                    "and do NOT continue to any other step until a valid number is captured.")
+            # Precise reason so the model re-asks correctly and never moves on with a
+            # missing/invalid number, and never fills in the caller's own number.
+            n = len(clean_phone)
+            if n < 10:
+                why = f"only {n} digit(s) were heard ('{clean_phone}'); {10 - n} more are needed"
+            elif n > 10:
+                why = f"{n} digits were heard ('{clean_phone}'); that is too many"
+            elif clean_phone[0] not in "6789":
+                why = f"'{clean_phone}' starts with {clean_phone[0]}, but Indian mobiles start with 6/7/8/9"
+            else:
+                why = f"'{clean_phone}' is not a valid mobile"
+            return (f"The phone number is not valid: {why}. Do NOT book and do NOT continue. Ask the caller to "
+                    "say their full 10-digit mobile number again slowly, digit by digit, then read it back to "
+                    "confirm. Never fill in, guess, or use the number they are calling from.")
             
         state.patient_phone = clean_phone
         state.patient_phone_confirmed = True
@@ -2274,7 +2339,7 @@ async def update_appointment_details(
     target_date = appointment_date or state.appointment_date
     target_time = appointment_time or state.appointment_time
     if (appointment_date or appointment_time) and target_date and target_time:
-        is_target_time_flex = target_time.lower().strip() in ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", "first available", "first available slot"]
+        is_target_time_flex = target_time.lower().strip() in ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", "turant", "turant wala", "turant wala slot", "abhi", "abhi ka", "abhi wala", "jaldi", "jaldi wala", "jald", "jitni jaldi ho sake", "immediate", "immediately", "now", "right now", "as soon as possible", "asap", "first available", "first available slot"]
         if not is_target_time_flex:
             res_date, res_time, err = validate_and_normalize_appointment_datetime(target_date, target_time)
             if err:
@@ -2407,7 +2472,7 @@ async def update_appointment_details(
                 if not docs:
                     state.department = None
                     await save_appointment_state(ctx.userdata["user_id"], state)
-                    return f"Error: No doctors are currently available in the {matched_dept} department. Please inform the user that no doctor or department is available for their issue and deny the appointment."
+                    return f"Error: The hospital has NO doctor in the {matched_dept} department. This is PERMANENT (the specialty is not offered here), NOT a today-only shortage. Tell the caller clearly that this specialty is not available at this hospital, and offer a department that DOES exist if one fits their problem. Do not imply a doctor might be available on another day."
                 # Filter by Redis availability at the user's requested time (if already known)
                 check_date = target_date
                 check_time = target_time
@@ -2477,7 +2542,7 @@ async def update_appointment_details(
                         state.reason = None
                         state.department = None
                         await save_appointment_state(ctx.userdata["user_id"], state)
-                        return f"Error: No doctors are currently available in the {new_dept} department. Please inform the user that no doctor or department is available for their issue and deny the appointment."
+                        return f"Error: The hospital has NO doctor in the {new_dept} department. This is PERMANENT (the specialty is not offered here), NOT a today-only shortage. Tell the caller clearly that this specialty is not available at this hospital, and offer a department that DOES exist if one fits their problem. Do not imply a doctor might be available on another day."
                     # Filter by Redis availability at the user's requested time (if already known)
                     check_date = target_date
                     check_time = target_time
@@ -2554,7 +2619,7 @@ async def update_appointment_details(
         is_flex_time = True
     if appointment_time:
         app_time_lower = appointment_time.lower().strip()
-        if app_time_lower in ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", "first available", "first available slot"]:
+        if app_time_lower in ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "कोई भी", "koi bhi", "sny time", "snytime", "कोई भी समय", "जब मिले", "किसी भी टाइम", "koi bhi samay", "jab mile", "kisi bhi time", "turant", "turant wala", "turant wala slot", "abhi", "abhi ka", "abhi wala", "jaldi", "jaldi wala", "jald", "jitni jaldi ho sake", "immediate", "immediately", "now", "right now", "as soon as possible", "asap", "first available", "first available slot"]:
             is_flex_time = True
             appointment_time = ""
             
@@ -2854,7 +2919,15 @@ async def verify_availability(ctx: RunContext) -> str:
     if not state.doctor_name:
         return "Missing doctor name. Cannot verify availability."
 
-    flex_keywords = ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "any date", "koi bhi", "koi bhi samay", "jab mile", "kisi bhi time", "कोई भी", "कोई भी समय", "first available"]
+    # GROUNDING GATE: refuse to verify a doctor/department not backed by verified
+    # data (blocks booking a doctor under a department they aren't in / fake dept).
+    _dept_err = await _doctor_department_error(state)
+    if _dept_err:
+        state.availability_verified = False
+        await save_appointment_state(ctx.userdata["user_id"], state)
+        return _dept_err
+
+    flex_keywords = ["any", "sny", "any time", "anytime", "flexible", "earliest", "earliest available", "any slot", "any date", "koi bhi", "koi bhi samay", "jab mile", "kisi bhi time", "turant", "turant wala", "turant wala slot", "abhi", "abhi ka", "abhi wala", "jaldi", "jaldi wala", "jald", "jitni jaldi ho sake", "immediate", "immediately", "now", "right now", "as soon as possible", "asap", "कोई भी", "कोई भी समय", "first available"]
     is_flex_time = state.appointment_time and state.appointment_time.lower().strip() in flex_keywords
     is_flex_date = not state.appointment_date or str(state.appointment_date).lower().strip() in flex_keywords
 
@@ -3178,6 +3251,13 @@ async def confirm_appointment(
     if not state.reason:
         await soft_pause()
         return "What is the reason for the visit?"
+
+    # GROUNDING GATE (hard): never book a doctor who doesn't belong to the stated
+    # department, a doctor who doesn't exist, or a department that doesn't exist.
+    _dept_err = await _doctor_department_error(state)
+    if _dept_err:
+        await revoke_confirmation()
+        return _dept_err
 
     # 2. GATE — the caller must have said yes to the summary before we book. This
     # no longer resets availability_verified (soft_pause), so a missed yes prompts
@@ -3562,15 +3642,13 @@ class HospitalReceptionistAgent(Agent):
         )
 
     async def _background_refresh_hospital_data(self) -> None:
-        """Refresh hospital data in the background — never blocks the LLM response.
+        """Reload hospital data in the background — never blocks the LLM response.
 
-        BUG FIX: this used to re-implement its own httpx fetch and ran on EVERY
-        user turn while completely ignoring the _DATA_CACHE TTL — so a long call
-        fired dozens of requests (2 retries each) at the external staging API, a
-        latency source and a retry-storm risk. It now delegates to
-        fetch_live_hospital_data(force=False), which is cache-aware (120s TTL) and
-        already carries the httpx + Playwright fallbacks and cache-file write. On a
-        cache hit this returns almost instantly and makes no network call at all.
+        Delegates to fetch_live_hospital_data(force=False), which now reads ONLY
+        from hospital_cache.json (no API/network) and is cache-aware (120s TTL), so
+        on a cache hit this returns instantly and does not even touch disk. It used
+        to re-run a full httpx/Playwright fetch on every single user turn against the
+        external staging API — removed.
         """
         try:
             data = await fetch_live_hospital_data(force=False)
