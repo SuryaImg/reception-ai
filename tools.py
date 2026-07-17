@@ -384,28 +384,189 @@ def clean_doctor_name(name: str) -> str:
     return cleaned
 
 
-def get_symptom_specialty(reason_str: str) -> Optional[str]:
-    if not reason_str:
+# ---------------------------------------------------------------------------
+# Symptom -> specialty routing table.
+#
+# Each rule is (keywords, ideal_specialty). `ideal_specialty` is the medically
+# correct department. If that department does not physically exist at this
+# hospital, get_symptom_specialty() falls back to General Physician (a GP can
+# triage and refer onward) rather than silently returning None — returning None
+# was the root cause of the "Brain clot -> Cardiology" mis-book: an unmatched
+# symptom disabled the whole symptom/department validation, letting the agent's
+# arbitrary department choice through unchecked.
+#
+# Order matters: more specific / higher-risk rules come first so that e.g.
+# "chest pain WITH breathing difficulty" or "brain" is caught before a generic
+# word later in the same sentence wins.
+# ---------------------------------------------------------------------------
+_SYMPTOM_RULES: list[tuple[list[str], str]] = [
+    # --- Neurology: brain, nerves, stroke, head. HIGH RISK -----------------
+    (["brain", "clot", "stroke", "haemorrhage", "hemorrhage", "aneurysm",
+      "tumor", "tumour", "fungus", "meningitis", "encephalitis",
+      "migraine", "headache", "sar dard", "sir dard", "dizziness", "vertigo",
+      "seizure", "epilepsy", "fits", "paralysis", "numbness", "tingling",
+      "tremor", "memory loss", "unconscious", "fainting", "slurred speech",
+      "brain me", "dimaag", "dimag", "nas", "nasein",
+      "दिमाग", "मस्तिष्क", "सिरदर्द", "सिर दर्द", "चक्कर", "लकवा", "मिर्गी", "नस", "नसों"],
+     "Neurologist"),
+
+    # --- Cardiology: heart, BP, chest (cardiac) ----------------------------
+    (["heart", "cardiac", "palpitation", "blood pressure", "bp high", "bp low",
+      "hypertension", "cholesterol", "chest pain", "chest tightness",
+      "heart attack", "angina", "dil", "dil ka", "chhaati", "seene me dard",
+      "दिल", "हृदय", "छाती", "सीने", "रक्तचाप", "धड़कन"],
+     "Cardiology"),
+
+    # --- Orthopedics: bones, joints, spine, fractures ----------------------
+    (["fracture", "bone", "broken", "joint", "knee", "hip", "shoulder",
+      "arthritis", "back pain", "backache", "spine", "slip disc", "sprain",
+      "ligament", "haddi", "haddi", "jodo", "ghutna", "kamar", "peeth",
+      "kandha", "moch",
+      "हड्डी", "जोड़", "जोड़ों", "घुटना", "कमर", "पीठ", "कंधा", "फ्रैक्चर", "मोच"],
+     "Orthopedics"),
+
+    # --- Surgeon: things needing operative intervention --------------------
+    (["hernia", "appendicitis", "appendix", "gallbladder", "gall bladder",
+      "gallstone", "kidney stone", "stone", "pathri", "lump", "cyst",
+      "abscess", "piles", "fistula", "fissure", "surgery", "operation",
+      "operate", "cut", "wound", "injury deep", "gaanth",
+      "पथरी", "गांठ", "सर्जरी", "ऑपरेशन", "बवासीर", "हर्निया"],
+     "Surgeon"),
+
+    # --- General Physician: the hospital's catch-all specialty -------------
+    # Also the fallback target for any ideal specialty the hospital lacks.
+    (["fever", "temperature", "bukhar", "taap", "viral", "infection",
+      "weakness", "fatigue", "tiredness", "body ache", "body pain",
+      "cough", "cold", "sore throat", "flu", "cough and cold",
+      "stomach", "stomach pain", "pet dard", "abdominal", "gas", "acidity",
+      "indigestion", "vomiting", "vomit", "nausea", "diarrhea", "diarrhoea",
+      "loose motion", "loose motions", "dehydration", "constipation",
+      "checkup", "check up", "general", "sugar", "diabetes", "thyroid",
+      "बुखार", "ताप", "खांसी", "जुकाम", "पेट दर्द", "पेट", "उल्टी", "दस्त",
+      "कमजोरी", "थकान", "गैस", "एसिडिटी", "शुगर", "मधुमेह"],
+     "General Physician"),
+
+    # --- Specialties this hospital does NOT staff. Ideal is listed for
+    #     documentation, but get_symptom_specialty will route these to the
+    #     GP fallback (per product decision: GP triages & refers). -----------
+    (["skin", "rash", "acne", "pimple", "itching", "eczema", "psoriasis",
+      "dermat", "khujli", "daane", "त्वचा", "खुजली", "दाने", "फुंसी"],
+     "Dermatology"),
+    (["eye", "vision", "blurry", "blurred", "cataract", "aankh", "aankhon",
+      "आंख", "आँख", "आंखों", "नजर", "दृष्टि"],
+     "Ophthalmology"),
+    (["ear", "nose", "throat", "tonsil", "sinus", "hearing", "kaan", "naak",
+      "gala", "कान", "नाक", "गला", "टॉन्सिल"],
+     "ENT"),
+    (["kidney", "urine", "urinary", "bladder", "prostate", "peshab", "peshaab",
+      "किडनी", "गुर्दा", "पेशाब", "मूत्र"],
+     "Urology"),
+    (["tooth", "teeth", "dental", "daant", "cavity", "gum", "दांत", "दंत", "मसूड़े"],
+     "Dentistry"),
+    (["breathing", "breathless", "asthma", "lung", "wheezing", "saans", "dama",
+      "सांस", "दमा", "फेफड़े"],
+     "Pulmonology"),
+    (["pregnant", "pregnancy", "delivery", "period", "menstrual", "gynae",
+      "pregnancy me", "garbh", "mahavari", "गर्भ", "गर्भवती", "प्रसव", "मासिक"],
+     "Gynecology"),
+    (["child", "baby", "infant", "kid", "bacche", "baccha", "shishu",
+      "बच्चे", "बच्चा", "शिशु"],
+     "Pediatrics"),
+    (["depression", "anxiety", "mental", "stress", "panic", "sleep", "insomnia",
+      "tanav", "avsad", "तनाव", "अवसाद", "मानसिक", "नींद"],
+     "Psychiatry"),
+    (["cancer", "cancerous", "malignant", "chemo", "oncolog", "कैंसर"],
+     "Oncology"),
+]
+
+
+# Departments that physically exist at this hospital fall back to General
+# Physician when a symptom's ideal specialty is unavailable.
+_FALLBACK_SPECIALTY = "General Physician"
+
+
+def _available_department_set(data: Optional[dict]) -> set[str]:
+    """Return a normalized set of department names actually offered by the
+    hospital, derived from live/cached data. Empty set means 'unknown', in
+    which case get_symptom_specialty returns the ideal specialty as-is."""
+    if data is None:
+        data = load_cache_data()
+    depts: set[str] = set()
+    if not isinstance(data, dict):
+        return depts
+    for d in data.get("departments", []) or []:
+        name = (d.get("name") if isinstance(d, dict) else str(d)) or ""
+        norm = normalize_department(name)
+        if norm:
+            depts.add(norm.lower())
+    for doc in data.get("doctors", []) or []:
+        if not isinstance(doc, dict):
+            continue
+        name = doc.get("department") or doc.get("specialization") or ""
+        norm = normalize_department(name)
+        if norm:
+            depts.add(norm.lower())
+    return depts
+
+
+def get_symptom_specialty(
+    reason_str: str,
+    available_departments: Optional[set[str]] = None,
+    data: Optional[dict] = None,
+) -> Optional[str]:
+    """Map a free-text reason/symptom to a department that this hospital can
+    actually serve.
+
+    Returns the ideal specialty if the hospital staffs it; otherwise falls back
+    to General Physician (who triages and refers). Only returns None when the
+    reason is empty or genuinely unclassifiable AND no fallback department
+    exists — so a recognized-but-unavailable specialty never silently disables
+    downstream symptom/department validation.
+
+    `available_departments`: pre-computed normalized (lowercase) set of existing
+    departments. If omitted, it is derived from `data` or the live cache.
+    """
+    if not reason_str or not reason_str.strip():
         return None
+
     r = reason_str.lower()
-    if any(w in r for w in ["fever", "bukhar", "taap", "बुखार", "ताप", "stomach", "pet dard", "पेट दर्द", "abdominal", "vomiting", "diarrhea", "loose motion", "nausea", "cough", "cold", "body ache"]):
-        return "General Physician"
-    if any(w in r for w in ["migraine", "dizziness", "headache", "seizure", "paralysis", "numbness", "सिरदर्द", "चक्कर"]):
-        return "Neurologist"
-    if any(w in r for w in ["asthma", "breathing", "lung", "दमा", "सांस"]):
-        return "Pulmonology"
-    if any(w in r for w in ["tooth", "teeth", "dent", "daant", "दांत"]):
-        return "Dentistry"
-    if any(w in r for w in ["chest", "palpitation", "heart", "blood pressure", "छाती", "दिल"]):
-        return "Cardiology"
-    if any(w in r for w in ["hernia", "appendicitis", "surgery", "operation", "stone", "gallbladder", "pathri", "पथरी", "सर्जरी", "ऑपरेशन"]):
-        return "Surgeon"
-    if any(w in r for w in ["fracture", "bone", "hand", "knee", "joint", "haddi", "हड्डी", "पीठ", "back pain"]):
-        return "Orthopedics"
-    if any(w in r for w in ["acne", "rash", "skin", "dermat"]):
-        return "Dermatology"
-    if any(w in r for w in ["kidney", "urine", "bladder", "urinary", "prostate", "किडनी", "गुर्दा", "पेशाब"]):
-        return "Urology"
+
+    if available_departments is None:
+        available_departments = _available_department_set(data)
+
+    def _resolve(ideal: str) -> Optional[str]:
+        # No knowledge of what's available -> trust the ideal specialty.
+        if not available_departments:
+            return ideal
+        norm_ideal = (normalize_department(ideal) or ideal)
+        if norm_ideal.lower() in available_departments:
+            return norm_ideal
+        # Ideal specialty not offered here -> GP fallback if GP exists.
+        fb = (normalize_department(_FALLBACK_SPECIALTY) or _FALLBACK_SPECIALTY)
+        if fb.lower() in available_departments:
+            logger.info(
+                "SYMPTOM ROUTING: '%s' -> ideal '%s' unavailable here; "
+                "routing to '%s'.", reason_str, norm_ideal, fb
+            )
+            return fb
+        # Not even GP exists -> return ideal so caller can inform the patient.
+        return norm_ideal
+
+    for keywords, ideal in _SYMPTOM_RULES:
+        if any(w in r for w in keywords):
+            return _resolve(ideal)
+
+    # Unclassifiable symptom: send to General Physician if available, so the
+    # booking is still validated against a real department instead of skipping
+    # the check entirely.
+    if available_departments:
+        fb = (normalize_department(_FALLBACK_SPECIALTY) or _FALLBACK_SPECIALTY)
+        if fb.lower() in available_departments:
+            logger.info(
+                "SYMPTOM ROUTING: '%s' unclassified; defaulting to '%s'.",
+                reason_str, fb
+            )
+            return fb
     return None
 
 
@@ -584,41 +745,26 @@ def validate_appointment(state: AppointmentState, data: Optional[dict] = None) -
     if not (clean_phone.isdigit() and len(clean_phone) == 10 and clean_phone[0] in "6789"):
         return False, "Invalid phone number."
 
-    # Validate reason matches department
-    symptom_dept = get_symptom_specialty(state.reason)
-    if symptom_dept:
-        def normalize_dept(d: str) -> str:
-            d_clean = d.lower().strip()
-            if "neuro" in d_clean: return "neurology"
-            if "dent" in d_clean: return "dentistry"
-            if "physician" in d_clean: return "general physician"
-            if "pulm" in d_clean: return "pulmonology"
-            if "derm" in d_clean: return "dermatology"
-            if "ortho" in d_clean: return "orthopedics"
-            if "cardio" in d_clean: return "cardiology"
-            if "surg" in d_clean: return "surgeon"
-            return d_clean
-
-        norm_symptom_dept = normalize_dept(symptom_dept)
-        norm_state_dept = normalize_dept(state.department)
-        
-        # Check forbidden combinations
-        # Face acne + Neurology
-        # Migraine + Dermatology
-        # Back pain + Neurology
-        is_acne = any(w in state.reason.lower() for w in ["acne", "skin", "rash"])
-        is_migraine = any(w in state.reason.lower() for w in ["migraine", "headache", "dizziness", "seizure"])
-        is_back = any(w in state.reason.lower() for w in ["back pain", "bone", "joint", "knee"])
-        
-        if is_acne and "neuro" in norm_state_dept:
-            return False, "Face acne is not consistent with Neurology."
-        if is_migraine and "derm" in norm_state_dept:
-            return False, "Migraine is not consistent with Dermatology."
-        if is_back and "neuro" in norm_state_dept:
-            return False, "Back pain is not consistent with Neurology."
+    # ------------------------------------------------------------------
+    # Validate reason matches department.
+    #
+    # symptom_dept is resolved against the departments the hospital actually
+    # offers (via live/cached data), so it is never a specialty that doesn't
+    # exist here. If the caller's symptom maps to a real department that
+    # differs from the one on the booking, that's a genuine mis-route
+    # (e.g. "Brain clot" booked under Cardiology) and must fail.
+    # ------------------------------------------------------------------
+    avail = _available_department_set(data) if data else None
+    symptom_dept = get_symptom_specialty(state.reason, available_departments=avail, data=data)
+    if symptom_dept and state.department:
+        norm_symptom_dept = (normalize_department(symptom_dept) or symptom_dept).lower()
+        norm_state_dept = (normalize_department(state.department) or state.department).lower()
 
         if norm_symptom_dept != norm_state_dept:
-            return False, "Symptom and department mismatch."
+            return False, (
+                f"Symptom/department mismatch: reason '{state.reason}' indicates "
+                f"'{symptom_dept}', but booking is under '{state.department}'."
+            )
 
     # Validate doctor matches department and qualification is consistent
     if data and "doctors" in data:
