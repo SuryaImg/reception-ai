@@ -1,3 +1,6 @@
+import utils.http_session
+import utils.transport
+import utils.session
 import asyncio
 import inspect
 import logging
@@ -140,7 +143,14 @@ _CACHE_TTL = 120.0
 
 _human_voice_instructions = (
     "=== Identity ===\n"
-    "You are Nikita, a professional female voice receptionist for Arora Hospital, handling live calls to book, look up, and reschedule appointments. Always use feminine Hindi verb forms ('bol rahi hoon', 'karti hoon'). Match the caller's language (Hindi, English, or Hinglish), and keep responses short (usually 1-2 sentences), confident, and natural — no filler words, no dead air, no repeating a sentence you already said. Each call starts with a clean slate; never refer to a previous call. If speech is garbled or unclear, ask the caller to repeat rather than guessing what they said.\n\n"
+    "You are Nikita, a professional female voice receptionist for Arora Hospital, handling live calls to book, look up, and reschedule appointments. You are female — when you speak Hindi or Hinglish, use feminine verb forms ('bol rahi hoon', 'karti hoon'); when you speak English, just speak natural English. Each call starts with a clean slate; never refer to a previous call. If speech is garbled or unclear, ask the caller to repeat rather than guessing what they said.\n\n"
+    "=== LANGUAGE (critical — follow exactly) ===\n"
+    "You open the call in Hindi (the default greeting), but you MUST then speak in whatever language the CALLER uses, and keep matching them for the rest of the call:\n"
+    "- If the caller replies in English, switch to English immediately and stay in English for the rest of the call — do NOT keep replying in Hindi just because the greeting was in Hindi.\n"
+    "- If the caller speaks Hindi, reply in Hindi. If they speak Hinglish (Hindi-English mix), reply in the same natural Hinglish.\n"
+    "- If they switch languages mid-call, switch with them on your very next reply.\n"
+    "- Judge the caller's language from THEIR words each turn, not from your greeting or your previous replies. When in doubt, mirror the language of their most recent message.\n"
+    "Keep responses short (usually 1-2 sentences), confident, and natural — no filler words, no dead air, no repeating a sentence you already said.\n\n"
     "=== CRITICAL: Never Leave Dead Air (but never repeat yourself) ===\n"
     "Respond within about 2 seconds of the caller finishing — dead air makes them think the line dropped. "
     "If a backend lookup genuinely takes a moment, you MAY say ONE short filler like 'Ek second...' or 'Haan ji, dekhti hoon' — but say it at most ONCE per lookup, and NEVER say the same filler again later in the call. Most turns need no filler at all; just answer. "
@@ -456,9 +466,9 @@ async def update_agent_instructions(agent, state: AppointmentState):
     # no matching doctor on duty rather than making a promise we can't back up.
     if any_active_now:
         if h_info.get("wheelChairStretcher") == "Yes":
-            arrival_resp = "'सीधे emergency entrance पर आइए — stretcher और team तैयार रहेगी।' (only say this if the on-duty emergency doctor's department is actually relevant to what the caller described — see the availability list below)"
+            arrival_resp = "Tell them to come straight to the emergency entrance and that a stretcher and team will be ready — in the caller's own language. (Only say this if the on-duty emergency doctor's department is actually relevant to what the caller described — see the availability list below.)"
         else:
-            arrival_resp = "'सीधे emergency entrance पर आइए — team तैयार रहेगी।' (only say this if the on-duty emergency doctor's department is actually relevant to what the caller described — see the availability list below)"
+            arrival_resp = "Tell them to come straight to the emergency entrance and that a team will be ready — in the caller's own language. (Only say this if the on-duty emergency doctor's department is actually relevant to what the caller described — see the availability list below.)"
     else:
         arrival_resp = "There is no emergency doctor on duty right now (see availability list below) — be honest about that instead of saying 'team will be ready'; still tell them to go to the nearest ER or call 108 (102 for pregnancy/labor) for anything urgent."
 
@@ -1448,14 +1458,8 @@ def validate_date(date_str: str) -> tuple[bool, Optional[str]]:
         return True, None
 
     if month < 1 or month > 12:
-        return False, "कृपया कोई वैध महीना बताएं।"
+        return False, "INVALID_MONTH: ask the caller for a valid month, in their own language."
 
-    month_names_hindi = {
-        1: "जनवरी", 2: "फ़रवरी", 3: "मार्च", 4: "अप्रैल",
-        5: "मई", 6: "जून", 7: "जुलाई", 8: "अगस्त",
-        9: "सितंबर", 10: "अक्टूबर", 11: "नवंबर", 12: "दिसंबर"
-    }
-    
     is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
     days_in_months = {
         1: 31, 2: 29 if is_leap else 28, 3: 31, 4: 30,
@@ -1465,14 +1469,15 @@ def validate_date(date_str: str) -> tuple[bool, Optional[str]]:
 
     max_days = days_in_months[month]
     if day < 1 or day > max_days:
-        month_name = month_names_hindi[month]
-        return False, f"{month_name} में केवल {max_days} दिन होते हैं। कृपया कोई वैध तारीख बताएं।"
+        return False, (f"INVALID_DATE: month {month} has only {max_days} days. "
+            "Ask the caller for a valid date, in their own language.")
 
     # Past date check — reject any date before today
     try:
         requested_date = datetime.date(year, month, day)
         if requested_date < _today_ist():
-            return False, f"यह तारीख बीत चुकी है। कृपया आज या भविष्य की कोई तारीख बताएं।"
+            return False, ("PAST_DATE: that date is in the past. Ask the caller for "
+                "today or a future date, in their own language.")
     except ValueError:
         pass
 
@@ -1503,7 +1508,8 @@ def validate_and_normalize_appointment_datetime(date_str: str, time_str: str) ->
                 minute = int(time_match_24.group(2))
                 am_pm = None
             else:
-                return date_str, time_str, "अपॉइंटमेंट का समय अमान्य है। कृपया एक निश्चित समय चुनें (जैसे 10:00 AM)।"
+                return date_str, time_str, ("INVALID_TIME: could not parse a specific clock time. "
+                    "Ask the caller for a specific time (e.g. 10:00 AM) in their own language.")
     else:
         hour = int(time_match.group(1))
         minute = int(time_match.group(2))
@@ -1517,7 +1523,8 @@ def validate_and_normalize_appointment_datetime(date_str: str, time_str: str) ->
     try:
         appt_dt = datetime.datetime(year, int(month), int(day), hour, minute)
     except ValueError:
-        return date_str, time_str, "तारीख या समय अमान्य है।"
+        return date_str, time_str, ("INVALID_DATETIME: the date or time is not valid. "
+            "Ask the caller to restate the date and time in their own language.")
         
     now = _now_ist()
     diff = (appt_dt - now).total_seconds()
@@ -1531,7 +1538,8 @@ def validate_and_normalize_appointment_datetime(date_str: str, time_str: str) ->
     # where 1:30/2:00 were offered then refused). A 60-second grace absorbs
     # clock rounding so "abhi ka" (right now) still books.
     if diff < -60:
-        return date_str, time_str, "यह समय बीत चुका है। कृपया अभी से आगे का कोई समय चुनें।"
+        return date_str, time_str, ("PAST_TIME: the requested time is in the past. "
+            "Ask the caller — in their own language — to choose a time from now onwards.")
 
     normalized_time = appt_dt.strftime("%I:%M %p").lstrip('0')
     normalized_date = appt_dt.strftime("%Y-%m-%d")
@@ -1603,6 +1611,17 @@ async def _doctor_department_error(state) -> Optional[str]:
                     f"NOT {state.department}. Do not book this. Tell the caller Dr. "
                     f"{clean_doctor_name(state.doctor_name)} is in {actual_dept}; if they need {state.department}, "
                     f"offer the real {state.department} doctors from check_available_doctors instead.")
+
+    # FINAL SAFETY GATE: the single symptom-based backstop, shared with
+    # validate_appointment. Fires only for a genuine high-risk mis-route
+    # (cardiac/neuro/oncology symptom booked under the wrong department when the
+    # hospital offers the right one). Never fires on generic/placeholder reasons
+    # or on correctly-booked specialists. Routing itself is the model's job.
+    from tools import check_high_risk_downgrade
+    if state.reason and state.department:
+        hr = check_high_risk_downgrade(state.reason, state.department, data)
+        if hr:
+            return hr
     return None
 
 
@@ -1901,8 +1920,8 @@ async def get_alternatives(doctor_name: str, date_str: str, time_slot: str, depa
         parts.append(f"वैकल्पिक डॉक्टर: {alt_doctor}")
 
     if parts:
-        return "यह स्लॉट पहले से ही बुक है। हमारे पास ये विकल्प उपलब्ध हैं: " + ", ".join(parts)
-    return "यह स्लॉट पहले से ही बुक है। कृपया कोई अन्य तारीख या समय चुनें।"
+        return "SLOT_TAKEN: that exact slot is already booked. Offer these alternatives to the caller in their own language: " + ", ".join(parts)
+    return "SLOT_TAKEN: that slot is already booked and no alternatives were found. Ask the caller — in their own language — to choose another date or time."
 
 
 async def get_first_consistent_doctor(dept_name: str) -> Optional[str]:
@@ -2284,9 +2303,10 @@ async def update_appointment_details(
         if not (clean_phone.isdigit() and len(clean_phone) == 10 and clean_phone[0] in "6789"):
             state.patient_phone = None  # Revert invalid/partial phone capture
             state.patient_phone_confirmed = False
-            state.phone_confirmation_attempts = 0
-            # Precise reason so the model re-asks correctly and never moves on with a
-            # missing/invalid number, and never fills in the caller's own number.
+            # Count failed phone attempts so we don't loop the identical
+            # "say it again" prompt forever (transcript: caller repeated a bad
+            # number 5-6 times with no way out).
+            state.phone_confirmation_attempts += 1
             n = len(clean_phone)
             if n < 10:
                 why = f"only {n} digit(s) were heard ('{clean_phone}'); {10 - n} more are needed"
@@ -2296,6 +2316,29 @@ async def update_appointment_details(
                 why = f"'{clean_phone}' starts with {clean_phone[0]}, but Indian mobiles start with 6/7/8/9"
             else:
                 why = f"'{clean_phone}' is not a valid mobile"
+
+            # After 2 failed attempts, offer the calling number as a fallback
+            # instead of asking a third, fourth, fifth time. The caller in the
+            # transcript literally said "the number I'm calling from" — honor it.
+            if state.phone_confirmation_attempts >= 2:
+                caller_clean = re.sub(r"\D", "", caller_phone_raw or "")
+                if len(caller_clean) > 10 and caller_clean.startswith("91"):
+                    caller_clean = caller_clean[2:]
+                elif len(caller_clean) == 11 and caller_clean.startswith("0"):
+                    caller_clean = caller_clean[1:]
+                if len(caller_clean) == 10 and caller_clean[0] in "6789":
+                    return (f"The phone number still isn't valid ({why}), and the caller has now been asked "
+                            f"{state.phone_confirmation_attempts} times. STOP re-asking the same way. Offer the "
+                            f"caller the number they are calling from as the contact number: read '{caller_clean}' "
+                            "back digit by digit and ask if they'd like to use THAT number. If they say yes, call "
+                            "update_appointment_details with use_caller_phone=True (and no patient_phone). If they "
+                            "say no, ask them to send it by SMS or spell it very slowly one more time.")
+                return (f"The phone number still isn't valid ({why}), and the caller has been asked "
+                        f"{state.phone_confirmation_attempts} times. STOP repeating the identical prompt. "
+                        "Acknowledge the difficulty, ask them to say ONLY the 10 digits very slowly one final "
+                        "time, and if it still fails, offer to note the booking without a confirmed number and "
+                        "have the front desk call them back. Do not loop.")
+
             return (f"The phone number is not valid: {why}. Do NOT book and do NOT continue. Ask the caller to "
                     "say their full 10-digit mobile number again slowly, digit by digit, then read it back to "
                     "confirm. Never fill in, guess, or use the number they are calling from.")
@@ -2390,7 +2433,7 @@ async def update_appointment_details(
             docs = await run_with_loading_announcement(
                 get_consistent_doctors_for_dept(target_dept),
                 session,
-                "धन्यवाद प्रतीक्षा के लिए, मैं जानकारी देख रही हूँ।"
+                "Ek moment, jaankari dekh rahi hoon."
             )
             if not docs:
                 return f"Error: No doctors available in the {target_dept} department."
@@ -2408,7 +2451,7 @@ async def update_appointment_details(
             res = await run_with_loading_announcement(
                 find_doctor_by_name(doctor_name),
                 session,
-                "धन्यवाद प्रतीक्षा के लिए, मैं जानकारी देख रही हूँ।"
+                "Ek moment, jaankari dekh rahi hoon."
             )
             if res["status"] == "single_match":
                 matched_doctor_obj = res["match"]
@@ -2425,40 +2468,50 @@ async def update_appointment_details(
                 return f"Error: Doctor '{doctor_name}' was not found. Please clarify the doctor's name."
         state.step_attempts["doctor_id"] = 0
 
-    # 8. Department validation
+    # 8. Department validation — fully data-driven (no hardcoded department
+    #    lists). Whether a department exists is decided ONLY by live hospital
+    #    data, so adding/removing a department in the backend needs no code
+    #    change. All caller-facing wording is produced by the model in the
+    #    caller's own language; tool results are language-neutral guidance.
     if department:
         norm_dept = normalize_department(department)
         if not state.department or (norm_dept and norm_dept.lower() != state.department.lower()):
             loop_err = check_loop("department")
             if loop_err: return loop_err
-        
-        # Check if it maps to an unsupported specialty
-        unsupported_depts = ["Dentistry", "ENT", "Dermatology", "Pulmonology", "Gastroenterology", "Urology", "Nephrology"]
-        if norm_dept in unsupported_depts:
-            hindi_names = {
-                "Dentistry": "दांतों का",
-                "ENT": "नाक, कान और गले का (ENT)",
-                "Dermatology": "त्वचा (Dermatology)",
-                "General Physician": "सामान्य रोग (General Physician)",
-                "Pulmonology": "फेफड़ों का (Pulmonology)",
-                "Gastroenterology": "पेट का (Gastroenterology)",
-                "Urology": "मूत्र रोग (Urology)",
-                "Nephrology": "किडनी (Nephrology)"
-            }
-            dept_name_hindi = hindi_names.get(norm_dept, norm_dept)
-            return f"माफ़ कीजिएगा, लेकिन हमारे यहाँ {dept_name_hindi} विभाग उपलब्ध नहीं है, इसलिए मैं इस विभाग के लिए अपॉइंटमेंट बुक नहीं कर सकती।"
-            
-        valid_depts = ["Cardiology", "Neurologist", "Orthopedics", "Surgeon", "General Physician"]
+
+        _live = await fetch_live_hospital_data(force=False)
+        _live_depts = {}  # normalized-lower -> canonical name as stored in data
+        if _live and _live.get("doctors"):
+            for _d in _live["doctors"]:
+                _dn = (_d.get("department") or _d.get("specialization") or "").strip()
+                if _dn:
+                    _live_depts[(normalize_department(_dn) or _dn).lower()] = _dn
+                    _live_depts[_dn.lower()] = _dn
+
+        # Match the requested department against departments that ACTUALLY exist.
         matched_dept = None
-        if norm_dept:
-            for vd in valid_depts:
-                if norm_dept.lower() == vd.lower():
-                    matched_dept = vd
-                    break
-        
+        if norm_dept and _live_depts:
+            key = norm_dept.lower()
+            if key in _live_depts:
+                matched_dept = _live_depts[key]
+        if not matched_dept and _live_depts:
+            # Try the raw text too (handles a name that didn't normalize).
+            rawk = (department or "").strip().lower()
+            if rawk in _live_depts:
+                matched_dept = _live_depts[rawk]
+
         if not matched_dept:
-            choices_str = ", ".join(valid_depts)
-            return f"Error: The department '{department}' is not recognized. Recognized departments are: {choices_str}."
+            # Department is not offered here. Give the model the REAL department
+            # list (from data) so it can tell the caller and offer a real choice.
+            real_list = sorted(set(_live_depts.values())) if _live_depts else []
+            real_str = ", ".join(real_list) if real_list else "(none available right now)"
+            return (
+                f"DEPARTMENT_UNAVAILABLE: '{department}' is not a department at this "
+                f"hospital. This is permanent (the specialty is not offered here), not "
+                f"a today-only shortage. Tell the caller — in their own language — that "
+                f"this specialty is unavailable here, and offer a department that DOES "
+                f"exist if one fits their problem. Real departments: {real_str}."
+            )
 
         if matched_dept != state.department:
             state.department = matched_dept
@@ -2467,7 +2520,7 @@ async def update_appointment_details(
                 docs = await run_with_loading_announcement(
                     get_consistent_doctors_for_dept(matched_dept),
                     session,
-                    "धन्यवाद प्रतीक्षा के लिए, मैं जानकारी देख रही हूँ।"
+                    "Ek moment, jaankari dekh rahi hoon."
                 )
                 if not docs:
                     state.department = None
@@ -2508,21 +2561,23 @@ async def update_appointment_details(
             new_dept = normalize_department(inferred_specialty)
             if new_dept and not department and new_dept != old_dept:
                 state.department = new_dept
-                
-                # Check if it is an unsupported department
-                unsupported_depts = ["Dentistry", "ENT", "Dermatology", "Pulmonology", "Gastroenterology", "Urology", "Nephrology"]
-                if new_dept in unsupported_depts:
-                    hindi_names = {
-                        "Dentistry": "दांतों का",
-                        "ENT": "नाक, कान और गले का (ENT)",
-                        "Dermatology": "त्वचा (Dermatology)",
-                        "General Physician": "सामान्य रोग (General Physician)",
-                        "Pulmonology": "फेफड़ों का (Pulmonology)",
-                        "Gastroenterology": "पेट का (Gastroenterology)",
-                        "Urology": "मूत्र रोग (Urology)",
-                        "Nephrology": "किडनी (Nephrology)"
-                    }
-                    dept_name_hindi = hindi_names.get(new_dept, new_dept)
+
+                # Is the inferred specialty one the hospital ACTUALLY offers?
+                # Decided by live data, not a hardcoded list.
+                _live = await fetch_live_hospital_data(force=False)
+                _live_depts = set()
+                if _live and _live.get("doctors"):
+                    for _d in _live["doctors"]:
+                        _dn = (_d.get("department") or _d.get("specialization") or "").strip()
+                        if _dn:
+                            _live_depts.add((normalize_department(_dn) or _dn).lower())
+                is_offered = (not _live_depts) or ((new_dept or "").lower() in _live_depts)
+
+                if not is_offered:
+                    real_list = sorted({(_d.get("department") or _d.get("specialization") or "").strip()
+                                        for _d in (_live.get("doctors") or [])
+                                        if (_d.get("department") or _d.get("specialization"))}) if _live else []
+                    real_str = ", ".join(real_list) if real_list else "(none available right now)"
                     state.doctor_name = None
                     state.doctor_id = None
                     state.appointment_date = None
@@ -2530,13 +2585,19 @@ async def update_appointment_details(
                     state.availability_verified = False
                     state.booking_status = "pending"
                     await save_appointment_state(ctx.userdata["user_id"], state)
-                    return f"माफ़ कीजिएगा, लेकिन हमारे यहाँ {dept_name_hindi} विभाग उपलब्ध नहीं है, इसलिए मैं आपकी इस समस्या के लिए अपॉइंटमेंट बुक नहीं कर सकती।"
+                    return (
+                        f"DEPARTMENT_UNAVAILABLE: the caller's issue points to '{new_dept}', "
+                        f"which this hospital does not offer (permanent, not a today-only "
+                        f"shortage). Tell the caller — in their own language — that this "
+                        f"specialty is unavailable here, and offer a department that DOES "
+                        f"exist if one fits. Real departments: {real_str}."
+                    )
 
                 if not doctor_name:
                     docs = await run_with_loading_announcement(
                         get_consistent_doctors_for_dept(new_dept),
                         session,
-                        "धन्यवाद प्रतीक्षा के लिए, मैं जानकारी देख रही हूँ।"
+                        "Ek moment, jaankari dekh rahi hoon."
                     )
                     if not docs:
                         state.reason = None
@@ -2574,40 +2635,110 @@ async def update_appointment_details(
                     await save_appointment_state(ctx.userdata["user_id"], state)
                     return f"You previously requested an appointment for {old_reason}. Since you are now reporting {theme}-related symptoms, I need to switch this appointment to {new_dept}."
 
-    # 10. Mismatch Check
+    # 10. Mismatch Check (self-healing, verified-data-first)
+    #
+    # The reason text is only a HINT for routing. The authoritative department is
+    # the one backed by verified hospital data — i.e. the department of the doctor
+    # actually selected (state.doctor_id / state.doctor_name), which is set from
+    # the live doctor record above. Re-guessing a department from free-text reason
+    # keywords and then REJECTING the caller when the guess disagrees was the root
+    # cause of the "spinal cord -> General Physician" false rejection: a partial or
+    # stale reason string ("स्पाइनल कॉर्ड" alone, or a leftover "food poisoning")
+    # mapped to a different department than the correctly-booked one.
+    #
+    # New behaviour:
+    #   - If a real doctor is locked, TRUST that doctor's department. If the reason
+    #     hint disagrees, silently re-align state.department to the doctor's real
+    #     department (self-heal) and do NOT reject.
+    #   - Only when NO doctor is locked yet do we surface a corrective message, and
+    #     even then only for a clear, unambiguous symptom->department signal that
+    #     maps to a department the hospital ACTUALLY has.
     target_reason = reason or state.reason
     target_dept = department or state.department
-    if target_reason and target_dept:
+
+    # Resolve the doctor's verified department (source of truth), if any.
+    verified_doctor_dept = None
+    if state.doctor_id or state.doctor_name:
+        try:
+            _data = await fetch_live_hospital_data(force=False)
+            if _data and _data.get("doctors"):
+                _target = clean_doctor_name(state.doctor_name or "").lower().strip()
+                for _d in _data["doctors"]:
+                    _dn = clean_doctor_name(_d.get("doctorName") or _d.get("name") or "").lower().strip()
+                    _did = _d.get("doctorId")
+                    if (state.doctor_id and _did == state.doctor_id) or (_target and _dn == _target):
+                        verified_doctor_dept = (_d.get("department") or _d.get("specialization") or "").strip()
+                        break
+        except Exception:
+            verified_doctor_dept = None
+
+    if verified_doctor_dept:
+        # A verified doctor is selected: their department wins. Re-align silently
+        # and skip the reject path entirely. The final grounding gate in
+        # confirm_appointment (_doctor_department_error) still enforces true
+        # clinical safety for high-risk symptom/department contradictions.
+        norm_vdd = (normalize_department(verified_doctor_dept) or verified_doctor_dept)
+        if not state.department or (norm_vdd and norm_vdd.lower() != (state.department or "").lower()):
+            state.department = norm_vdd
+        target_dept = state.department
+    elif target_reason and target_dept:
+        # No doctor locked yet — reason hint may correct an explicit wrong dept.
         forbidden_msg = check_forbidden_combination(target_reason, target_dept)
         if forbidden_msg:
             return forbidden_msg
-            
-        symptom_dept = get_symptom_specialty(target_reason)
-        if symptom_dept:
-            def normalize_dept(d: str) -> str:
-                d_clean = d.lower().strip()
-                if "neuro" in d_clean: return "neurology"
-                if "dent" in d_clean: return "dentistry"
-                if "physician" in d_clean: return "general physician"
-                if "pulm" in d_clean: return "pulmonology"
-                if "derm" in d_clean: return "dermatology"
-                if "ortho" in d_clean: return "orthopedics"
-                if "cardio" in d_clean: return "cardiology"
-                if "surg" in d_clean: return "surgeon"
-                return d_clean
 
-            if normalize_dept(symptom_dept) != normalize_dept(target_dept):
-                await save_appointment_state(ctx.userdata["user_id"], state)
-                hindi_dept_names = {
-                    "Cardiology": "कार्डियोलॉजी (Cardiology)",
-                    "Neurologist": "न्यूरोलॉजिस्ट (Neurology)",
-                    "Orthopedics": "ऑर्थोपेडिक्स (Orthopedics)",
-                    "Surgeon": "सर्जन (Surgeon)",
-                    "General Physician": "सामान्य रोग (General Physician)"
-                }
-                inferred_hindi = hindi_dept_names.get(symptom_dept, symptom_dept)
-                target_hindi = hindi_dept_names.get(target_dept, target_dept)
-                return f"Error: आपकी समस्या ({target_reason}) {inferred_hindi} विभाग से संबंधित है, इसलिए इसे {target_hindi} विभाग में बुक नहीं किया जा सकता।"
+        # Derive against departments the hospital ACTUALLY offers so we never
+        # reject over an unavailable-specialty (that has its own handling), and
+        # so a partial reason that only maps to the GP catch-all doesn't override
+        # a more specific department the caller/we already established.
+        from tools import _available_department_set as _avail_set, _FALLBACK_SPECIALTY as _FB
+        _data = await fetch_live_hospital_data(force=False)
+        _avail = _avail_set(_data)
+        symptom_dept = get_symptom_specialty(
+            target_reason, available_departments=_avail or None, data=_data
+        )
+
+        # Only act when the symptom gives a NON-fallback, specific signal. If the
+        # reason maps to the General Physician catch-all, treat it as "no strong
+        # signal" and do NOT use it to override an already-chosen specialist dept.
+        symptom_is_specific = bool(symptom_dept) and (
+            (normalize_department(symptom_dept) or symptom_dept).lower()
+            != (normalize_department(_FB) or _FB).lower()
+        )
+
+        if symptom_dept and symptom_is_specific:
+            # Normalize both sides to a canonical department identity for the
+            # "did the model infer a different specialty?" comparison.
+            norm_sym = (normalize_department(symptom_dept) or symptom_dept).lower()
+            norm_tgt = (normalize_department(target_dept) or target_dept or "").lower()
+            depts_differ = norm_sym != norm_tgt
+
+            if depts_differ:
+                if not department:
+                    # We (not the caller) inferred the department earlier from a
+                    # weaker signal; the reason now points somewhere more specific.
+                    # Silently self-heal to the stronger signal and continue.
+                    state.department = (normalize_department(symptom_dept) or symptom_dept)
+                    state.doctor_name = None
+                    state.doctor_id = None
+                    state.appointment_date = None
+                    state.appointment_time = None
+                    state.availability_verified = False
+                    state.booking_status = "pending"
+                    target_dept = state.department
+                else:
+                    # The caller explicitly named a department that conflicts with
+                    # a specific symptom. Surface it for the model to resolve —
+                    # as language-neutral guidance, so the model speaks the
+                    # caller's own language rather than a hardcoded Hindi string.
+                    await save_appointment_state(ctx.userdata["user_id"], state)
+                    return (
+                        f"DEPARTMENT_CONFLICT: the caller's stated reason "
+                        f"('{target_reason}') points to the '{symptom_dept}' "
+                        f"department, but they asked to book under '{target_dept}'. "
+                        f"Ask the caller — in their own language — which department "
+                        f"they want, and book only once that is clear. Do not guess."
+                    )
 
     if appointment_date:
         state.appointment_date = appointment_date
@@ -2937,17 +3068,17 @@ async def verify_availability(ctx: RunContext) -> str:
             found_date, found_time = await run_with_loading_announcement(
                 find_chronological_earliest_slot(state.doctor_name),
                 session,
-                "मैं आपके लिए सबसे पहला उपलब्ध समय देख रही हूँ।"
+                "Ek moment, sabse pehla available time dekh rahi hoon."
             )
             if not found_date or not found_time:
                 state.availability_verified = False
                 await save_appointment_state(ctx.userdata["user_id"], state)
-                return "क्षमा करें, आने वाले 30 दिनों में कोई अपॉइंटमेंट स्लॉट उपलब्ध नहीं है। कृपया बाद में प्रयास करें।"
+                return "NO_SLOTS_30_DAYS: no appointment slots are available in the next 30 days. Tell the caller this in their own language and suggest trying later."
             
             state.appointment_date = found_date
             state.appointment_time = found_time
         except Exception as e:
-            return "अपॉइंटमेंट स्लॉट चेक करते समय सिस्टम में तकनीकी समस्या आ गई है, कृपया बाद में प्रयास करें।"
+            return "SLOT_CHECK_ERROR: a technical problem occurred while checking slots. Apologize to the caller in their own language and suggest trying again shortly."
 
     if not state.appointment_date or not state.appointment_time:
         return "Missing date, or time. Cannot verify availability."
@@ -3087,7 +3218,7 @@ async def verify_availability(ctx: RunContext) -> str:
             user_id=ctx.userdata.get("session_id", ctx.userdata.get("user_id", "anonymous"))
         ),
         session,
-        "एक क्षण, मैं उपलब्ध स्लॉट देख रही हूँ।"
+        "Ek moment, available slot dekh rahi hoon."
     )
     if not locked:
         state.availability_verified = False
@@ -3341,7 +3472,7 @@ async def confirm_appointment(
                 doctor_name=state.doctor_name
             )
             if existing_bookings:
-                return "इस समय के लिए आपकी अपॉइंटमेंट पहले से मौजूद है।"
+                return "DUPLICATE_BOOKING: this exact appointment already exists for this caller. Tell them — in their own language — that it is already booked."
 
             # Set booking in progress
             state.booking_status = "BOOKING_IN_PROGRESS"
@@ -3381,7 +3512,7 @@ async def confirm_appointment(
                         user_id=current_session_id
                     ),
                     session,
-                    "एक क्षण, मैं उपलब्ध स्लॉट देख रही हूँ।"
+                    "Ek moment, available slot dekh rahi hoon."
                 )
             
             # Lock is now BEST-EFFORT only (it serves as light idempotency / a
